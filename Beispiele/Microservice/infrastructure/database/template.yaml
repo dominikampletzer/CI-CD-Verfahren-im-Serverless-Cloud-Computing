@@ -1,0 +1,81 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: The Cf-Stack for the climate-microservice ecs task&service
+
+Parameters:
+  Stage:
+    Type: String
+  Suffix:
+    Type: String
+  #import from existing-stacks:
+  VpcStackName:
+    Type: String
+
+Resources:
+  RDSDBSubnetGroup:
+    Type: "AWS::RDS::DBSubnetGroup"
+    Properties:
+      DBSubnetGroupDescription: "Created from the RDS Management Console"
+      DBSubnetGroupName: !Sub "${Stage}-my-group"
+      SubnetIds:
+        - Fn::ImportValue: !Sub ${VpcStackName}:PublicSubnetA
+        - Fn::ImportValue: !Sub ${VpcStackName}:PublicSubnetB
+        - Fn::ImportValue: !Sub ${VpcStackName}:PublicSubnetC
+
+  EC2SecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Created by RDS management console"
+      GroupName: !Sub "db-security-group-${Stage}-${Suffix}"
+      VpcId:
+        Fn::ImportValue: !Sub ${VpcStackName}:VpcId
+      SecurityGroupIngress:
+        - CidrIp: "0.0.0.0/0"
+          FromPort: 5432
+          IpProtocol: "tcp"
+          ToPort: 5432
+        - CidrIpv6: "::/0"
+          FromPort: 5432
+          IpProtocol: "tcp"
+          ToPort: 5432
+      SecurityGroupEgress:
+        - CidrIp: "0.0.0.0/0"
+          IpProtocol: "-1"
+
+  RDSDBInstance:
+    Type: "AWS::RDS::DBInstance"
+    Properties:
+      DBInstanceIdentifier: !Sub "my-postgres-db-${Stage}-${Suffix}"
+      AllocatedStorage: "20"
+      DBInstanceClass: "db.t2.micro"
+      Engine: "postgres"
+      PreferredBackupWindow: "22:27-22:57"
+      BackupRetentionPeriod: 0
+      PreferredMaintenanceWindow: "tue:02:52-tue:03:22"
+      MultiAZ: false
+      EngineVersion: "12.3"
+      AutoMinorVersionUpgrade: false
+      LicenseModel: "postgresql-license"
+      PubliclyAccessible: true
+      StorageType: "gp2"
+      Port: "5432"
+      StorageEncrypted: false
+      CopyTagsToSnapshot: false
+      MonitoringInterval: 0
+      EnableIAMDatabaseAuthentication: false
+      EnablePerformanceInsights: false
+      DeletionProtection: false
+      DBSubnetGroupName: !Sub "${Stage}-my-group"
+      VPCSecurityGroups:
+        - !Ref EC2SecurityGroup
+      DBParameterGroupName: "default.postgres12"
+      OptionGroupName: "default:postgres-12"
+      CACertificateIdentifier: "rds-ca-2019"
+      DBSnapshotIdentifier: "arn:aws:rds:eu-central-1:532622493081:snapshot:base-postgres-db-snapshot"
+      # Snapshot dient dazu eine Basis-DB aufzusetzen. Der Snapshot wurde vorab mit allen Accounts geteilt
+
+Outputs:
+  DataBaseEndpoint:
+    Description: The Name of the ECS-service
+    Value: !GetAtt RDSDBInstance.Endpoint.Address
+    Export:
+      Name: !Sub ${AWS::StackName}:Endpoint

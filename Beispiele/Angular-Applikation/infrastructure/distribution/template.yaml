@@ -1,0 +1,68 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Parameters:
+  BucketName:
+    Description: "Get from CloudFormation"
+    Type: String
+
+Resources:
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+
+  S3BucketPolicy:
+    Type: "AWS::S3::BucketPolicy"
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Statement:
+          - Sid: "AllowCloudFrontAccessIdentity"
+            Effect: "Allow"
+            Action:
+              - "s3:GetObject"
+            Resource:
+              - !Join [ "", [ "arn:aws:s3:::" , !Ref S3Bucket, "/*" ] ]
+            Principal:
+              AWS: !Join [ " ", [ "arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity" , !Ref CloudFrontOriginAccessIdentity ] ]
+          - Sid: "deleteItems"
+            Effect: "Allow"
+            Action:
+              - "s3:DeleteObject"
+              - "s3:DeleteObjectVersion"
+            Resource:
+              - !Join [ "", [ "arn:aws:s3:::" , !Ref S3Bucket, "/*" ] ]
+            Principal:
+              AWS:
+                - !Sub "arn:aws:iam::${AWS::AccountId}:role/CodePipelineServiceRole-${AWS::Region}-${AWS::AccountId}"
+
+  CloudFrontOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: "first-try"
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - ConnectionAttempts: 3
+            ConnectionTimeout: 10
+            DomainName: !GetAtt S3Bucket.DomainName
+            Id: !Ref BucketName
+            S3OriginConfig:
+              OriginAccessIdentity: !Join [ "", [ "origin-access-identity/cloudfront/", !Ref CloudFrontOriginAccessIdentity ] ]
+        DefaultCacheBehavior:
+          TargetOriginId: !Ref BucketName
+          AllowedMethods:
+            - GET
+            - HEAD
+          ViewerProtocolPolicy: redirect-to-https
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+        DefaultRootObject: index.html
+        Enabled: true

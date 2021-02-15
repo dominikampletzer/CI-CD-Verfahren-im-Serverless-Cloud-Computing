@@ -1,0 +1,134 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Parameters:
+  Project:
+    Description: Project name
+    Type: String
+  Repository:
+    Description: Repository name
+    Type: String
+  Suffix:
+    Description: Sanitized suffix name, safe to use for CF resource names
+    Type: String
+  Branch:
+    Description: The original unsanitized branch name to reference in Git configuration
+    Type: String
+  Stage:
+    Description: "Pipeline stage"
+    Type: String
+    AllowedValues: ["dev", "delivery"]
+  RemotePreviewAccount:
+    Description: "Remote child account: development or integration"
+    Type: String
+    AllowedPattern: (\d{12}|^$)
+    ConstraintDescription: must be an AWS account ID
+  RemoteDeliveryAccount:
+    Description: "Remote delivery child account: production"
+    Type: String
+    Default: "NO_VALUE"
+  ArtifactBucket:
+    Description: "Artifact Bucket"
+    Type: String
+  PipelineKmsKeyArn:
+    Description: "Pipeline KMS key"
+    Type: String
+  PipelineServiceRoleArn:
+    Description: Service role ARN to pass to pipeline
+    Type: String
+  DynamicPipelineCleanupLambdaArn:
+    Description: CF Stack cleanup Lambda ARN
+    Type: String
+
+Conditions:
+  ShouldCreateForDelivery: !Equals [ !Ref Stage, "delivery" ]
+  ShouldCreateForDev: !Equals [ !Ref Stage, "dev" ]
+
+Resources:
+
+  CodeBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Ref AWS::StackName
+      Source:
+        Type: CODEPIPELINE
+      Environment: # your Build Machine
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:4.0
+        EnvironmentVariables: {}
+      Artifacts:
+        Type: CODEPIPELINE
+      ServiceRole: !Ref PipelineServiceRoleArn
+      TimeoutInMinutes: 10 # adjust Timeout to avoid broken builds
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Join [ '-', [ !Ref Stage, !Ref Repository ] ]
+      ArtifactStore:
+        EncryptionKey:
+          Id: !Ref PipelineKmsKeyArn
+          Type: "KMS"
+        Location: !Ref ArtifactBucket
+        Type: "S3"
+      RestartExecutionOnUpdate: False
+      RoleArn: !Ref PipelineServiceRoleArn
+      Stages:
+        - Name: Checkout-SourceCode
+          Actions:
+            - Name: Checkout-SourceCode
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: <YourSCM> # GitHub | GitLab | BitBucket
+                Version: "1"
+              Configuration:
+                Owner: !Ref Project
+                Repo: !Ref Repository
+                Branch: !Ref Branch
+                PollForSourceChanges: true
+                OAuthToken: "{{resolve:secretsmanager:<YourSecret>:SecretString:<YourTokenName>}}"
+              OutputArtifacts:
+                - Name: "SourceArtifact"
+              RunOrder: 1
+        - Name: "BuildStageForIntAndDev"
+          Actions:
+            - Name: "Build"
+              ActionTypeId:
+                Category: "Build"
+                Owner: AWS
+                Provider: "CodeBuild"
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref CodeBuild
+              InputArtifacts:
+                - Name: "SourceArtifact"
+              OutputArtifacts:
+                - Name: BuildArtifact
+              RunOrder: 1
+            # Infrastructure and Deploy for Integration and Development
+        - !If
+          - ShouldCreateForDelivery
+          - Name: "PROD-Approval"
+            Actions:
+              - Name: "ManualApproval"
+                ActionTypeId:
+                  Category: Approval
+                  Owner: AWS
+                  Provider: Manual
+                  Version: "1"
+                Configuration: { }
+                RunOrder: 1
+                Region: !Sub ${AWS::Region}
+          - !Ref AWS::NoValue
+          # Infrastructure and Deploy for Production
+
+  CleanupForInfrastruktureStack:
+    Type: "AWS::CloudFormation::CustomResource"
+    Condition: ShouldCreateForDev
+    Version: '1.0'
+    Properties:
+      ServiceToken: !Ref DynamicPipelineCleanupLambdaArn
+      RoleArn: !Sub arn:aws:iam::${RemotePreviewAccount}:role/CodePipelineServiceRole-${AWS::Region}-${RemotePreviewAccount}
+      Region: !Ref AWS::Region
+      StackName: # Stack Name from Infrastructure creation

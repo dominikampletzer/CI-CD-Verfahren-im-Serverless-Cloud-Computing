@@ -1,0 +1,40 @@
+version: 0.2
+
+env:
+  variables:
+    STAGE: "get value from pipeline-cloudformation"
+    DEVOPS_ACCOUNT_ID: "get value from pipeline-cloudformation"
+    ECR_NAME: "get value from pipeline-cloudformation"
+    REPOSITORY: "get value from pipeline-cloudformation"
+    SUFFIX: "get value from pipeline-cloudformation"
+
+phases:
+  install:
+    runtime-versions:
+      java: openjdk11
+  pre_build:
+    commands:
+      - set -e
+      - echo log-in into ecr
+      - aws ecr get-login-password --region eu-central-1 | docker login --username AWS --password-stdin ${DEVOPS_ACCOUNT_ID}.dkr.ecr.eu-central-1.amazonaws.com
+      - REPOSITORY_URI=${DEVOPS_ACCOUNT_ID}.dkr.ecr.eu-central-1.amazonaws.com/${ECR_NAME}
+  build:
+    commands:
+      - echo start build on `date`
+      - mvn clean install -DskipTests=true
+      - set -e
+      - ls -lah
+      - |
+          echo "start build and push process for PREVIEW " $STAGE
+
+          make -f locator/Makefile build-to-jvm-docker-aws
+
+          docker tag ${REPOSITORY}-${SUFFIX}-preview-image:${SUFFIX} \
+          $REPOSITORY_URI:${SUFFIX}
+
+          docker push $REPOSITORY_URI:${SUFFIX}
+          printf '[{"name":"%s-%s-container","imageUri":"%s:%s"}]' ${REPOSITORY} ${SUFFIX} ${REPOSITORY_URI} ${SUFFIX} > imagedefinitions.json
+
+artifacts:
+  files:
+    - imagedefinitions.json

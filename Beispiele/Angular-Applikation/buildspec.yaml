@@ -1,0 +1,31 @@
+version: 0.2
+
+env:
+  variables:
+    CONFIGURATION: "get value from pipeline-cloudformation"
+    APIDNS: "get value from pipeline-cloudformation"
+phases:
+  install:
+    runtime-versions:
+      nodejs: 10
+  pre_build:
+    commands:
+      - set -e
+      - echo "install something"
+      - npm install
+  build:
+    commands:
+      - set -e
+      - echo "run Tests"
+      - ./node_modules/.bin/ng test --watch=false --browsers ChromeHeadlessNoSandbox
+      - echo "add base path to application:"${APIDNS}
+      - echo {\"basepath\":\"${APIDNS}\"} > src/environments/basepath.json
+      - echo "start Build with config:"${CONFIGURATION}
+      - ./node_modules/.bin/ng build --configuration=${CONFIGURATION}
+  post_build:
+    commands:
+      - echo "next should be pushing to S3"
+artifacts:
+  files:
+    - "build/dummy-angular-project/*"
+  discard-paths: yes

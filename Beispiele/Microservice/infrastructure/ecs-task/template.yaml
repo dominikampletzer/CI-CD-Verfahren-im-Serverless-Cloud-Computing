@@ -1,0 +1,139 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: The Cf-Stack for the climate-microservice ecs task&service
+
+Parameters:
+  Repository:
+    Type: String
+  Stage:
+    Type: String
+  Suffix:
+    Type: String
+  #import from existing-stacks:
+  VpcStackName:
+    Type: String
+  ElbStackName:
+    Type: String
+  DataBaseStackName:
+    Type: String
+  EcsClusterStackName:
+    Type: String
+  EcrName:
+    Type: String
+  DevOpsAccountId:
+    Type: String
+
+Resources:
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      RoleName: !Sub ecsTaskExecRole-${Repository}-${Stage}-${Suffix}
+      Description: "The microservice ecsTaskExecutionRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      Memory: "512"
+      Cpu: "256"
+      ContainerDefinitions:
+        - Name: !Sub ${Repository}-${Suffix}-container
+          Image: !Sub "${DevOpsAccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrName}:${Suffix}"
+          Memory: 512
+          Cpu: 256
+          PortMappings:
+            - ContainerPort: 8080
+              HostPort: 8080
+              Protocol: tcp
+          Essential: true
+          Environment:
+            - Name: 'foo'
+              Value: !Sub
+                - '-Dquarkus.datasource.jdbc.url=jdbc:postgresql://${Endpoint}:5432/postgres'
+                - Endpoint:
+                    Fn::ImportValue:
+                      !Sub "${DataBaseStackName}:Endpoint"
+  ServiceSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ecsServiceSG-${Repository}-${Stage}-${Suffix}
+      GroupDescription: !Sub ECS-service SecurityGroup for ${Repository}-${Stage}-${Suffix}
+      SecurityGroupIngress:
+        - Description: "Inbound Rule for tcp on port 8080 for ipv4"
+          FromPort: 8080
+          ToPort: 8080
+          IpProtocol: tcp
+          SourceSecurityGroupId:
+            Fn::ImportValue: !Sub ${ElbStackName}:Alb-SG-Id
+      Tags:
+        - Key: Name
+          Value: !Sub ecsServiceSG-${Repository}-${Stage}-${Suffix}
+        - Key: Microservice
+          Value: !Sub ${Repository}
+        - Key: Stage
+          Value: !Sub ${Stage}
+      VpcId:
+        Fn::ImportValue: !Sub ${VpcStackName}:VpcId
+
+  ServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ecsServiceRole-${Repository}-${Stage}-${Suffix}
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceRole'
+
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      LaunchType: FARGATE
+      TaskDefinition: !Ref TaskDefinition
+      Cluster:
+        Fn::ImportValue: !Sub ${EcsClusterStackName}:ecsArn
+      ServiceName: !Sub ecsService-${Repository}-${Stage}-${Suffix}
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      DesiredCount: 1
+      NetworkConfiguration:
+        AwsVpcConfiguration:
+          AssignPublicIp: "ENABLED"
+          SecurityGroups:
+            - !Ref ServiceSG
+          Subnets:
+            - Fn::ImportValue: !Sub ${VpcStackName}:PublicSubnetA
+            - Fn::ImportValue: !Sub ${VpcStackName}:PublicSubnetB
+            - Fn::ImportValue: !Sub ${VpcStackName}:PublicSubnetC
+      LoadBalancers:
+        - ContainerName: !Sub ${Repository}-${Suffix}-container
+          ContainerPort: 8080
+          TargetGroupArn:
+            Fn::ImportValue: !Sub ${ElbStackName}:TargetGroupARN
+
+Outputs:
+  ServiceNameOutput:
+    Description: The Name of the ECS-service
+    Value: !GetAtt Service.Name
+    Export:
+      Name: !Sub ${AWS::StackName}:serviceName

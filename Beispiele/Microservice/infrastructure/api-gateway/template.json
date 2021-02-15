@@ -1,0 +1,233 @@
+{
+  "Description": "The Cf-Stack for api gateway",
+  "Parameters": {
+    "ElbStackName": {
+      "Type": "String"
+    }
+  },
+  "Resources": {
+    "MyApiGateway": {
+      "Type": "AWS::ApiGateway::RestApi",
+      "Properties": {
+        "Name": "MY BE-API",
+        "Description": "API used for BE-Project",
+        "FailOnWarnings": true,
+        "Body": {
+          "swagger": "2.0",
+          "info": {
+            "title": "MY BE-API"
+          },
+          "paths": {
+            "/dummy/my": {
+              "get": {
+                "x-amazon-apigateway-integration": {
+                  "uri": {
+                    "Fn::Join": [
+                      "",
+                      [
+                        "http://",
+                        {
+                          "Fn::ImportValue": {
+                            "Fn::Sub": "${ElbStackName}:Alb-DNS"
+                          }
+                        },
+                        "/dummy/my"
+                      ]
+                    ]
+                  },
+                  "passthroughBehavior": "when_no_match",
+                  "httpMethod": "ANY",
+                  "timeoutInMillis": 29000,
+                  "type": "http_proxy"
+                }
+              }
+            },
+            "/locator": {
+              "get": {
+                "parameters": [
+                  {
+                    "name": "ordering-userid",
+                    "in": "query",
+                    "schema": {
+                      "type": "string"
+                    }
+                  }
+                ],
+                "x-amazon-apigateway-integration": {
+                  "uri": {
+                    "Fn::Join": [
+                      "",
+                      [
+                        "http://",
+                        {
+                          "Fn::ImportValue": {
+                            "Fn::Sub": "${ElbStackName}:Alb-DNS"
+                          }
+                        },
+                        "/locator"
+                      ]
+                    ]
+                  },
+                  "responses": {
+                    "default": {
+                      "statusCode": "200"
+                    }
+                  },
+                  "passthroughBehavior": "when_no_match",
+                  "httpMethod": "ANY",
+                  "type": "http_proxy"
+                }
+              },
+              "options": {
+                "parameters": [
+                  {
+                    "name": "ordering-userid",
+                    "in": "query",
+                    "schema": {
+                      "type": "string"
+                    }
+                  }
+                ],
+                "x-amazon-apigateway-integration": {
+                  "uri": {
+                    "Fn::Join": [
+                      "",
+                      [
+                        "http://",
+                        {
+                          "Fn::ImportValue": {
+                            "Fn::Sub": "${ElbStackName}:Alb-DNS"
+                          }
+                        },
+                        "/locator"
+                      ]
+                    ]
+                  },
+                  "responses": {
+                    "default": {
+                      "statusCode": "200"
+                    }
+                  },
+                  "passthroughBehavior": "when_no_match",
+                  "httpMethod": "OPTIONS",
+                  "type": "http_proxy"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "ApiGatewayCloudWatchLogsRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [
+                  "apigateway.amazonaws.com"
+                ]
+              },
+              "Action": [
+                "sts:AssumeRole"
+              ]
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "ApiGatewayLogsPolicy",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:DescribeLogGroups",
+                    "logs:DescribeLogStreams",
+                    "logs:PutLogEvents",
+                    "logs:GetLogEvents",
+                    "logs:FilterLogEvents"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "ApiGatewayAccount": {
+      "Type": "AWS::ApiGateway::Account",
+      "Properties": {
+        "CloudWatchRoleArn": {
+          "Fn::GetAtt": [
+            "ApiGatewayCloudWatchLogsRole",
+            "Arn"
+          ]
+        }
+      }
+    },
+    "MyApiStage": {
+      "DependsOn": [
+        "ApiGatewayAccount"
+      ],
+      "Type": "AWS::ApiGateway::Stage",
+      "Properties": {
+        "DeploymentId": {
+          "Ref": "ApiDeployment"
+        },
+        "MethodSettings": [
+          {
+            "DataTraceEnabled": true,
+            "HttpMethod": "*",
+            "LoggingLevel": "INFO",
+            "ResourcePath": "/*"
+          }
+        ],
+        "RestApiId": {
+          "Ref": "MyApiGateway"
+        },
+        "StageName": "LATEST"
+      }
+    },
+    "ApiDeployment": {
+      "Type": "AWS::ApiGateway::Deployment",
+      "Properties": {
+        "RestApiId": {
+          "Ref": "MyApiGateway"
+        },
+        "StageName": "DevStage"
+      }
+    }
+  },
+  "Outputs": {
+    "InvokeURL": {
+      "Description": "Invoke URL",
+      "Value": {
+        "Fn::Join": [
+          "",
+          [
+            "https://",
+            {
+              "Ref": "MyApiGateway"
+            },
+            ".",
+            {
+              "Ref": "AWS::Region"
+            },
+            ".amazonaws.com/LATEST"
+          ]
+        ]
+      },
+      "Export": {
+        "Name": "InvokeURL"
+      }
+    }
+  }
+}

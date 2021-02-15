@@ -1,0 +1,455 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Parameters:
+  Project:
+    Description: Project name
+    Type: String
+  Repository:
+    Description: Repository name
+    Type: String
+  Suffix:
+    Description: Sanitized suffix name, safe to use for CF resource names
+    Type: String
+  Branch:
+    Description: The original unsanitized branch name to reference in Git configuration
+    Type: String
+  Stage:
+    Description: "Pipeline stage"
+    Type: String
+    AllowedValues: [ "dev", "delivery" ]
+  RemotePreviewAccount:
+    Description: "Remote child account: development or integration"
+    Type: String
+    AllowedPattern: (\d{12}|^$)
+    ConstraintDescription: must be an AWS account ID
+  RemoteDeliveryAccount:
+    Description: "Remote delivery child account: production"
+    Type: String
+    Default: "NO_VALUE"
+  ArtifactBucket:
+    Description: "Artifact Bucket"
+    Type: String
+  PipelineKmsKeyArn:
+    Description: "Pipeline KMS key"
+    Type: String
+  PipelineServiceRoleArn:
+    Description: Service role ARN to pass to pipeline
+    Type: String
+  DynamicPipelineCleanupLambdaArn:
+    Description: CF Stack cleanup Lambda ARN
+    Type: String
+
+Conditions:
+  ShouldCreateForDelivery: !Equals [ !Ref Stage, "delivery" ]
+  ShouldCreateForDev: !Equals [ !Ref Stage, "dev" ]
+
+
+Resources:
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${Stage}-ecr-services-${Suffix}"
+      RepositoryPolicyText:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowPushPull
+            Effect: Allow
+            Principal:
+              AWS:
+                - !Sub arn:aws:iam::${AWS::AccountId}:root
+                - !Sub arn:aws:iam::${RemotePreviewAccount}:root
+                - !If [ ShouldCreateForDelivery, !Sub "arn:aws:iam::${RemoteDeliveryAccount}:root", !Ref "AWS::NoValue" ]
+            Action:
+              - "ecr:BatchCheckLayerAvailability"
+              - "ecr:BatchDeleteImage"
+              - "ecr:BatchGetImage"
+              - "ecr:CompleteLayerUpload"
+              - "ecr:DeleteLifecyclePolicy"
+              - "ecr:DeleteRepository"
+              - "ecr:DeleteRepositoryPolicy"
+              - "ecr:DescribeImages"
+              - "ecr:DescribeRepositories"
+              - "ecr:GetDownloadUrlForLayer"
+              - "ecr:GetLifecyclePolicy"
+              - "ecr:GetLifecyclePolicyPreview"
+              - "ecr:GetRepositoryPolicy"
+              - "ecr:InitiateLayerUpload"
+              - "ecr:ListImages"
+              - "ecr:PutImage"
+              - "ecr:PutLifecyclePolicy"
+              - "ecr:SetRepositoryPolicy"
+      LifecyclePolicy: # LifecyclePolicy muss natürlich auf die jeweiligen Anforderungen angepasst werden
+        LifecyclePolicyText: |
+          {
+              "rules": [
+                  {
+                      "rulePriority": 1,
+                      "description": "Expire images older than 1 days",
+                      "selection": {
+                          "tagStatus": "untagged",
+                          "countType": "sinceImagePushed",
+                          "countUnit": "days",
+                          "countNumber": 1
+                      },
+                      "action": {
+                          "type": "expire"
+                      }
+                  }
+              ]
+          }
+
+  CodeBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:3.0
+        Type: LINUX_CONTAINER
+        PrivilegedMode: True
+        EnvironmentVariables:
+          - Name: STAGE
+            Value: !Ref Stage
+          - Name: DEVOPS_ACCOUNT_ID
+            Value: !Sub ${AWS::AccountId}
+          - Name: ECR_NAME
+            Value: !Ref ECRRepository
+          - Name: REPOSITORY
+            Value: !Ref Repository
+          - Name: SUFFIX
+            Value: !Ref Suffix
+      Name: !Ref AWS::StackName
+      ServiceRole: !Ref PipelineServiceRoleArn
+      TimeoutInMinutes: 10
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${Repository}-service-pipeline-${Stage}-${Suffix}"
+      ArtifactStore:
+        EncryptionKey:
+          Id: !Ref PipelineKmsKeyArn
+          Type: "KMS"
+        Location: !Ref ArtifactBucket
+        Type: "S3"
+      RestartExecutionOnUpdate: False
+      RoleArn: !Ref PipelineServiceRoleArn
+      Stages:
+        - Name: Checkout-SourceCode
+          Actions:
+            - Name: Checkout-SourceCode
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: "1"
+              Configuration:
+                Owner: !Ref Project
+                Repo: !Ref Repository
+                Branch: !Ref Branch
+                PollForSourceChanges: !If [ ShouldCreateForDelivery, "true", "false" ] # in general i would set to true
+                OAuthToken: "{{resolve:secretsmanager:GitHubToken:SecretString:GitHubToken}}"
+              OutputArtifacts:
+                - Name: "SourceArtifact"
+              RunOrder: 1
+
+        - Name: "Build"
+          Actions:
+            - Name: "Build"
+              ActionTypeId:
+                Category: "Build"
+                Owner: AWS
+                Provider: "CodeBuild"
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref CodeBuild
+              InputArtifacts:
+                - Name: "SourceArtifact"
+              OutputArtifacts:
+                - Name: BuildArtifact
+              RunOrder: 1
+
+        - Name: !If
+            - ShouldCreateForDelivery
+            - 'DeployInfrastructureToInt'
+            - 'DeployInfrastructureToDev'
+          Actions:
+            - Name: DeployALB
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                StackName: !Sub elb-${Stage}-${Suffix}
+                RoleArn: !Sub "arn:aws:iam::${RemotePreviewAccount}:role/CodePipelineDeploymentRole-${AWS::Region}-${RemotePreviewAccount}"
+                TemplatePath: "SourceArtifact::infrastructure/application-load-balancer/template.yaml"
+                ParameterOverrides:
+                  Fn::Sub: |
+                    {
+                      "Project": "${Project}",
+                      "Repository": "${Repository}",
+                      "Stage": "${Stage}",
+                      "Suffix" : "${Suffix}",
+                      "VpcStackName": "base-vpc-${Stage}-master"
+                    }
+              InputArtifacts:
+                - Name: SourceArtifact
+              RoleArn: !Sub "arn:aws:iam::${RemotePreviewAccount}:role/CodePipelineServiceRole-${AWS::Region}-${RemotePreviewAccount}"
+              RunOrder: 1
+
+            - Name: DeployEcsTaskAndService
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                StackName: !Sub "ecsTaskAndService-${Stage}-${Suffix}"
+                RoleArn: !Sub arn:aws:iam::${RemotePreviewAccount}:role/CodePipelineDeploymentRole-${AWS::Region}-${RemotePreviewAccount}
+                TemplatePath: "SourceArtifact::infrastructure/ecs-task/template.yaml"
+                ParameterOverrides:
+                  Fn::Sub: |
+                    {
+                      "Repository": "${Repository}",
+                      "Stage": "${Stage}",
+                      "Suffix" : "${Suffix}",
+                      "VpcStackName": "base-vpc-${Stage}-master",
+                      "ElbStackName": "elb-${Stage}-${Suffix}",
+                      "EcsClusterStackName": "base-ecsCluster-${Stage}-master",
+                      "EcrName": "${ECRRepository}",
+                      "DevOpsAccountId": "${AWS::AccountId}",
+                      "DataBaseStackName": "postgres-db-${Stage}-${Suffix}"
+                    }
+              InputArtifacts:
+                - Name: "SourceArtifact"
+              RoleArn: !Sub arn:aws:iam::${RemotePreviewAccount}:role/CodePipelineServiceRole-${AWS::Region}-${RemotePreviewAccount}
+              RunOrder: 2
+
+            - Name: DeployDB
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                StackName: !Sub "postgres-db-${Stage}-${Suffix}"
+                RoleArn: !Sub arn:aws:iam::${RemotePreviewAccount}:role/CodePipelineDeploymentRole-${AWS::Region}-${RemotePreviewAccount}
+                TemplatePath: "SourceArtifact::infrastructure/database/template.yaml"
+                ParameterOverrides:
+                  Fn::Sub: |
+                    {
+                      "Stage": "${Stage}",
+                      "Suffix" : "${Suffix}",
+                      "VpcStackName": "base-vpc-${Stage}-master"
+                    }
+              InputArtifacts:
+                - Name: "SourceArtifact"
+              RoleArn: !Sub arn:aws:iam::${RemotePreviewAccount}:role/CodePipelineServiceRole-${AWS::Region}-${RemotePreviewAccount}
+              RunOrder: 1
+
+            - Name: DeployAPIGateway
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                StackName: !Sub "apiGateway-${Stage}-${Suffix}"
+                RoleArn: !Sub arn:aws:iam::${RemotePreviewAccount}:role/CodePipelineDeploymentRole-${AWS::Region}-${RemotePreviewAccount}
+                TemplatePath: "SourceArtifact::infrastructure/api-gateway/template.json"
+                ParameterOverrides:
+                  Fn::Sub: |
+                    {
+                      "ElbStackName": "elb-${Stage}-${Suffix}"
+                    }
+              InputArtifacts:
+                - Name: "SourceArtifact"
+              RoleArn: !Sub arn:aws:iam::${RemotePreviewAccount}:role/CodePipelineServiceRole-${AWS::Region}-${RemotePreviewAccount}
+              RunOrder: 2
+
+        - !If
+          - ShouldCreateForDelivery
+          - Name: "Prod-Approve"
+            Actions:
+              - Name: Approve
+                ActionTypeId:
+                  Category: Approval
+                  Owner: AWS
+                  Provider: Manual
+                  Version: "1"
+                Configuration:
+                  CustomData: 'Approve or Reject with comments here.'
+                RunOrder: 1
+          - !Ref AWS::NoValue
+
+        - !If
+          - ShouldCreateForDelivery
+          - Name: 'DeployInfrastructureToProd'
+            Actions:
+              - Name: DeployELB
+                ActionTypeId:
+                  Category: Deploy
+                  Owner: AWS
+                  Provider: CloudFormation
+                  Version: "1"
+                Configuration:
+                  ActionMode: CREATE_UPDATE
+                  Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                  StackName: !Sub elb-${Stage}-${Suffix}
+                  RoleArn: !Sub "arn:aws:iam::${RemoteDeliveryAccount}:role/CodePipelineDeploymentRole-${AWS::Region}-${RemoteDeliveryAccount}"
+                  TemplatePath: "SourceArtifact::infrastructure/application-load-balancer/template.yaml"
+                  ParameterOverrides:
+                    Fn::Sub: |
+                      {
+                        "Project": "${Project}",
+                        "Repository": "${Repository}",
+                        "Stage": "${Stage}",
+                        "Suffix" : "${Suffix}",
+                        "VpcStackName": "base-vpc-${Stage}-master"
+                      }
+                InputArtifacts:
+                  - Name: SourceArtifact
+                RoleArn: !Sub "arn:aws:iam::${RemoteDeliveryAccount}:role/CodePipelineServiceRole-${AWS::Region}-${RemoteDeliveryAccount}"
+                RunOrder: 1
+
+              - Name: DeployDB
+                ActionTypeId:
+                  Category: Deploy
+                  Owner: AWS
+                  Provider: CloudFormation
+                  Version: "1"
+                Configuration:
+                  ActionMode: CREATE_UPDATE
+                  Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                  StackName: !Sub "postgres-db-${Stage}-${Suffix}"
+                  RoleArn: !Sub arn:aws:iam::${RemoteDeliveryAccount}:role/CodePipelineDeploymentRole-${AWS::Region}-${RemoteDeliveryAccount}
+                  TemplatePath: "SourceArtifact::infrastructure/database/template.yaml"
+                  ParameterOverrides:
+                    Fn::Sub: |
+                      {
+                        "Stage": "${Stage}",
+                        "Suffix" : "${Suffix}",
+                        "VpcStackName": "base-vpc-${Stage}-master"
+                      }
+                InputArtifacts:
+                  - Name: "SourceArtifact"
+                RoleArn: !Sub arn:aws:iam::${RemoteDeliveryAccount}:role/CodePipelineServiceRole-${AWS::Region}-${RemoteDeliveryAccount}
+                RunOrder: 1
+
+              - Name: DeployEcsTaskAndService
+                ActionTypeId:
+                  Category: Deploy
+                  Owner: AWS
+                  Provider: CloudFormation
+                  Version: "1"
+                Configuration:
+                  ActionMode: CREATE_UPDATE
+                  Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                  StackName: !Sub "ecsTaskAndService-${Stage}-${Suffix}"
+                  RoleArn: !Sub "arn:aws:iam::${RemoteDeliveryAccount}:role/CodePipelineDeploymentRole-${AWS::Region}-${RemoteDeliveryAccount}"
+                  TemplatePath: "SourceArtifact::infrastructure/ecs-task/template.yaml"
+                  ParameterOverrides:
+                    Fn::Sub: |
+                      {
+                        "Project": "${Project}",
+                        "Repository": "${Repository}",
+                        "Stage": "${Stage}",
+                        "Suffix" : "${Suffix}",
+                        "VpcStackName": "base-vpc-${Stage}-master",
+                        "ElbStackName": "elb-${Stage}-${Suffix}",
+                        "EcsClusterStackName": "base-ecsCluster-${Stage}-master",
+                        "EcrName": "${ECRRepository}",
+                        "DevOpsAccountId": "${AWS::AccountId}"
+                      }
+                InputArtifacts:
+                  - Name: SourceArtifact
+                RoleArn: !Sub "arn:aws:iam::${RemoteDeliveryAccount}:role/CodePipelineServiceRole-${AWS::Region}-${RemoteDeliveryAccount}"
+                RunOrder: 2
+
+              - Name: DeployAPIGateway
+                ActionTypeId:
+                  Category: Deploy
+                  Owner: AWS
+                  Provider: CloudFormation
+                  Version: "1"
+                Configuration:
+                  ActionMode: CREATE_UPDATE
+                  Capabilities: CAPABILITY_NAMED_IAM,CAPABILITY_AUTO_EXPAND
+                  StackName: !Sub "apiGateway-${Stage}-${Suffix}"
+                  RoleArn: !Sub arn:aws:iam::${RemoteDeliveryAccount}:role/CodePipelineDeploymentRole-${AWS::Region}-${RemoteDeliveryAccount}
+                  TemplatePath: "SourceArtifact::infrastructure/api-gateway/template.json"
+                  ParameterOverrides:
+                    Fn::Sub: |
+                      {
+                        "ElbStackName": "elb-${Stage}-${Suffix}"
+                      }
+                InputArtifacts:
+                  - Name: "SourceArtifact"
+                RoleArn: !Sub arn:aws:iam::${RemoteDeliveryAccount}:role/CodePipelineServiceRole-${AWS::Region}-${RemoteDeliveryAccount}
+                RunOrder: 2
+          - !Ref AWS::NoValue
+
+  CleanupEcsTaskAndService:
+    Type: "AWS::CloudFormation::CustomResource"
+    Condition: ShouldCreateForDev
+    DependsOn: [ CleanupELB,CleanupDB ]
+    Version: '1.0'
+    Properties:
+      ServiceToken: !Ref DynamicPipelineCleanupLambdaArn
+      RoleArn: !Sub arn:aws:iam::${RemotePreviewAccount}:role/CodePipelineServiceRole-${AWS::Region}-${RemotePreviewAccount}
+      Region: !Ref AWS::Region
+      StackName: !Sub "ecsTaskAndService-${Stage}-${Suffix}"
+
+  CleanupAPIGateway:
+    Type: "AWS::CloudFormation::CustomResource"
+    Condition: ShouldCreateForDev
+    DependsOn: CleanupELB
+    Version: '1.0'
+    Properties:
+      ServiceToken: !Ref DynamicPipelineCleanupLambdaArn
+      RoleArn: !Sub arn:aws:iam::${RemotePreviewAccount}:role/CodePipelineServiceRole-${AWS::Region}-${RemotePreviewAccount}
+      Region: !Ref AWS::Region
+      StackName: !Sub "apiGateway-${Stage}-${Suffix}"
+
+  CleanupELB:
+    Type: "AWS::CloudFormation::CustomResource"
+    Condition: ShouldCreateForDev
+    Version: '1.0'
+    Properties:
+      ServiceToken: !Ref DynamicPipelineCleanupLambdaArn
+      RoleArn: !Sub arn:aws:iam::${RemotePreviewAccount}:role/CodePipelineServiceRole-${AWS::Region}-${RemotePreviewAccount}
+      Region: !Ref AWS::Region
+      StackName: !Sub "elb-${Stage}-${Suffix}"
+
+  CleanupECR: # es gab Probleme damit, was als erstes entfernt wird CleanupECR oder ECR. Scheint durch DependsOn behoben worden zu sein
+    Type: "AWS::CloudFormation::CustomResource"
+    Condition: ShouldCreateForDev
+    DependsOn: ECRRepository
+    Version: '1.0'
+    Properties:
+      ServiceToken: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:DeleteEcrImagesLambda" #Lambda wird von Serverless CI/CD mitgeliefert
+      RoleArn: !Sub arn:aws:iam::${RemotePreviewAccount}:role/CodePipelineServiceRole-${AWS::Region}-${RemotePreviewAccount}
+      Region: !Ref AWS::Region
+      RepositoryName: !Sub "${Stage}-ecr-services-${Suffix}"
+
+  CleanupDB:
+    Type: "AWS::CloudFormation::CustomResource"
+    Condition: ShouldCreateForDev
+    Version: '1.0'
+    Properties:
+      ServiceToken: !Ref DynamicPipelineCleanupLambdaArn
+      RoleArn: !Sub arn:aws:iam::${RemotePreviewAccount}:role/CodePipelineServiceRole-${AWS::Region}-${RemotePreviewAccount}
+      Region: !Ref AWS::Region
+      StackName: !Sub "postgres-db-${Stage}-${Suffix}"

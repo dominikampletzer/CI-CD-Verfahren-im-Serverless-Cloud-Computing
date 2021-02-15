@@ -1,0 +1,16 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Cloudformation-Stack for Microservices
+
+Parameters: {}
+
+Resources:
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+
+Outputs:
+  ecsArn:
+    Description: "ARN of ECS-Cluster"
+    Value:
+      Ref: "ECSCluster"
+    Export:
+      Name: !Sub "${AWS::StackName}:ecsArn"
